@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distributed-key-value-store"
+version = "0.1.0"
+description = "A Raft-replicated, linearizable key-value store"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+distributed-key-value-store = "distributed_key_value_store.client.cli:main"
+distributed-key-value-store-node = "distributed_key_value_store.server.main:main"
+conclave = "distributed_key_value_store.client.cli:main"
+conclave-node = "distributed_key_value_store.server.main:main"
+
+[tool.setuptools.packages.find]
+include = ["distributed_key_value_store*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: spawns real processes (slower)"]

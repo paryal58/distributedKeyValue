@@ -1,0 +1,41 @@
+# 3-node cluster (default):   docker compose up --build
+# 5-node cluster:             CLUSTER=5 docker compose --profile five up --build
+#
+# Each node publishes its client/Raft port on localhost (5001..5005), so the host-side CLI works:
+#   python -m distributed_key_value_store --config config/docker-3.json status
+# Node data lives in ./data/docker/<node>, so killing and restarting containers exercises real recovery.
+
+x-node: &node
+  build: .
+  image: distributed-key-value-store:latest
+  restart: "no"
+  stop_grace_period: 3s
+
+services:
+  node1:
+    <<: *node
+    command: ["--id", "node1", "--config", "/app/config/docker-${CLUSTER:-3}.json", "--data-dir", "/data"]
+    ports: ["5001:5001"]
+    volumes: ["./data/docker/node1:/data"]
+  node2:
+    <<: *node
+    command: ["--id", "node2", "--config", "/app/config/docker-${CLUSTER:-3}.json", "--data-dir", "/data"]
+    ports: ["5002:5002"]
+    volumes: ["./data/docker/node2:/data"]
+  node3:
+    <<: *node
+    command: ["--id", "node3", "--config", "/app/config/docker-${CLUSTER:-3}.json", "--data-dir", "/data"]
+    ports: ["5003:5003"]
+    volumes: ["./data/docker/node3:/data"]
+  node4:
+    <<: *node
+    profiles: ["five"]
+    command: ["--id", "node4", "--config", "/app/config/docker-${CLUSTER:-3}.json", "--data-dir", "/data"]
+    ports: ["5004:5004"]
+    volumes: ["./data/docker/node4:/data"]
+  node5:
+    <<: *node
+    profiles: ["five"]
+    command: ["--id", "node5", "--config", "/app/config/docker-${CLUSTER:-3}.json", "--data-dir", "/data"]
+    ports: ["5005:5005"]
+    volumes: ["./data/docker/node5:/data"]

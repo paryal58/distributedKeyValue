@@ -1,0 +1,20 @@
+{
+  "election_timeout_min": 0.3,
+  "election_timeout_max": 0.6,
+  "heartbeat_interval": 0.1,
+  "request_timeout": 3.0,
+  "nodes": {
+    "node1": {
+      "host": "node1",
+      "port": 5001
+    },
+    "node2": {
+      "host": "node2",
+      "port": 5002
+    },
+    "node3": {
+      "host": "node3",
+      "port": 5003
+    }
+  }
+}

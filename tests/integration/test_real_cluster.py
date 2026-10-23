@@ -101,6 +101,33 @@ def test_full_cluster_restart_recovers_from_disk():
         assert all(kv.get(f"k{i}") == i for i in range(15))
 
 
+def test_snapshot_compaction_and_session_limit_survive_restart():
+    with ProcCluster(n=3, fsync=True, snapshot_threshold=4,
+                     max_client_sessions=2) as c:
+        c.wait_for_leader()
+        kv = c.client(client_id="snapshot-client", timeout=10)
+        victim = next(n for n in c.ids if n != c.wait_for_leader())
+        c.kill(victim)
+        for i in range(12):
+            kv.put(f"snap-{i}", i)
+        assert any(st and st["snapshot_index"] >= 4
+                   for nid, st in kv.status().items() if nid != victim)
+
+        second = c.client(client_id="second-client", timeout=10)
+        second.put("second-session", True)
+        with pytest.raises(RuntimeError, match="429"):
+            c.client(client_id="third-client", timeout=10).put("rejected", True)
+
+        c.restart(victim)
+        assert c.wait_converged(timeout=15)["snap-11"] == 11
+        c.stop_all()
+        c.start_all()
+        c.wait_for_leader(timeout=15)
+        assert c.wait_converged(timeout=15)["second-session"] is True
+        with pytest.raises(RuntimeError, match="429"):
+            c.client(client_id="third-client", timeout=10).put("still-rejected", True)
+
+
 def test_paused_leader_is_replaced_and_rejoins_as_follower(cluster):
     kv = cluster.client()
     kv.put("a", 1)

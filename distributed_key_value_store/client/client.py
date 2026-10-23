@@ -10,7 +10,7 @@ import http.client
 import json
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote
 
 
@@ -20,14 +20,18 @@ class ClusterUnavailable(Exception):
 
 class Client:
     def __init__(self, nodes: dict, client_id: Optional[str] = None, timeout: float = 10.0,
-                 http_timeout: float = 5.0):
+                 http_timeout: float = 5.0, initial_seq: int = 0,
+                 on_sequence: Optional[Callable[[int], None]] = None):
         """nodes: {node_id: "host:port"}"""
         self.nodes = dict(nodes)
         self.ids = list(self.nodes)
         self.client_id = client_id or uuid.uuid4().hex[:12]
         self.timeout = timeout
         self.http_timeout = http_timeout
-        self.seq = 0
+        if initial_seq < 0:
+            raise ValueError("initial_seq must be non-negative")
+        self.seq = initial_seq
+        self.on_sequence = on_sequence
         self.target = self.ids[0]
         self.last_leader: Optional[str] = None
         self.last_term: Optional[int] = None
@@ -87,14 +91,19 @@ class Client:
         raise ClusterUnavailable(f"gave up after {self.timeout}s ({last})")
 
     # ---- API ------------------------------------------------------------
-    def put(self, key: str, value) -> None:
+    def _next_seq(self):
         self.seq += 1
+        if self.on_sequence:
+            self.on_sequence(self.seq)
+
+    def put(self, key: str, value) -> None:
+        self._next_seq()
         self._call("PUT", f"/kv/{quote(key, safe='')}",
                    {"value": value, "client_id": self.client_id, "seq": self.seq})
 
     def delete(self, key: str) -> bool:
         """Returns True if the key existed."""
-        self.seq += 1
+        self._next_seq()
         data = self._call("DELETE", f"/kv/{quote(key, safe='')}",
                           {"client_id": self.client_id, "seq": self.seq})
         return bool(data["result"].get("existed"))

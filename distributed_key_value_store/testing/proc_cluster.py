@@ -32,7 +32,8 @@ def free_ports(n):
 
 
 class ProcCluster:
-    def __init__(self, n=3, workdir=None, election=(0.3, 0.6), heartbeat=0.1, fsync=False):
+    def __init__(self, n=3, workdir=None, election=(0.3, 0.6), heartbeat=0.1, fsync=False,
+                 snapshot_threshold=1000, max_client_sessions=10000):
         self.n = n
         self.ids = [f"node{i}" for i in range(1, n + 1)]
         self.workdir = workdir or tempfile.mkdtemp(prefix="distributed-key-value-store-")
@@ -43,6 +44,8 @@ class ProcCluster:
         self.config = {
             "election_timeout_min": election[0], "election_timeout_max": election[1],
             "heartbeat_interval": heartbeat, "request_timeout": 3.0,
+            "snapshot_threshold": snapshot_threshold,
+            "max_client_sessions": max_client_sessions,
             "nodes": {nid: {"host": "127.0.0.1", "port": p} for nid, p in zip(self.ids, ports)},
         }
         os.makedirs(os.path.join(self.workdir, "logs"), exist_ok=True)

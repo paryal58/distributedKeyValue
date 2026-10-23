@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import socket
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -57,6 +56,9 @@ def make_http_server(bind, port, raft_server, request_timeout=3.0):
         def _outcome(self, status, payload):
             node = raft_server.node
             if status == "ok":
+                if isinstance(payload, dict) and payload.get("ok") is False:
+                    return self._reply(429, {"error": payload.get("error"),
+                                             "limit": payload.get("limit")})
                 return self._reply(200, {"ok": True, "result": payload, "leader": node.id, "term": node.current_term})
             if status == "not_leader":
                 return self._reply(421, {"error": "not_leader", "leader": payload})
@@ -87,8 +89,6 @@ def make_http_server(bind, port, raft_server, request_timeout=3.0):
                     value, cid, seq = parsed["value"], parsed.get("client_id"), parsed.get("seq")
             except ValueError:
                 pass
-            if cid is None or seq is None:  # e.g. plain curl: no retry-dedup, just a fresh session
-                cid, seq = f"http-{uuid.uuid4().hex[:12]}", 1
             cmd = {"op": "put", "key": key, "value": value, "client_id": cid, "seq": seq}
             self._outcome(*raft_server.write(cmd, request_timeout))
 
@@ -97,10 +97,10 @@ def make_http_server(bind, port, raft_server, request_timeout=3.0):
             key = self._key()
             if key is None:
                 return self._reply(404, {"error": "not_found"})
-            cid, seq = f"http-{uuid.uuid4().hex[:12]}", 1
+            cid, seq = None, None
             try:
                 parsed = json.loads(raw) if raw else {}
-                cid, seq = parsed.get("client_id", cid), parsed.get("seq", seq)
+                cid, seq = parsed.get("client_id"), parsed.get("seq")
             except (ValueError, AttributeError):
                 pass
             cmd = {"op": "delete", "key": key, "client_id": cid, "seq": seq}

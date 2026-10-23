@@ -35,6 +35,7 @@ class RaftNode:
         election_timeout=(0.3, 0.6),
         heartbeat_interval: float = 0.1,
         max_batch: int = 64,
+        snapshot_threshold: int = 1000,
         rng: Optional[random.Random] = None,
         now: float = 0.0,
     ):
@@ -45,6 +46,9 @@ class RaftNode:
         self.election_timeout = election_timeout
         self.heartbeat_interval = heartbeat_interval
         self.max_batch = max_batch
+        if snapshot_threshold < 1:
+            raise ValueError("snapshot_threshold must be positive")
+        self.snapshot_threshold = snapshot_threshold
         self.rng = rng or random.Random()
         self.logger = logging.getLogger(f"distributed_key_value_store.raft.{node_id}")
 
@@ -52,11 +56,17 @@ class RaftNode:
         term, voted_for, entries = storage.load()
         self.current_term: int = term
         self.voted_for: Optional[str] = voted_for
-        self.log = Log(entries)
+        self.snapshot = storage.load_snapshot()
+        base_index = storage.log_base_index
+        base_term = self.snapshot["last_included_term"] if self.snapshot else 0
+        self.log = Log(entries, base_index=base_index, base_term=base_term)
 
         # volatile state
-        self.commit_index = 0
-        self.last_applied = 0
+        snapshot_index = self.snapshot["last_included_index"] if self.snapshot else 0
+        self.commit_index = snapshot_index
+        self.last_applied = snapshot_index
+        if self.snapshot:
+            self.sm.restore(self.snapshot["state"])
         self.role = FOLLOWER
         self.leader_id: Optional[str] = None
         self.votes: set = set()
@@ -101,8 +111,12 @@ class RaftNode:
             "voted_for": self.voted_for,
             "commit_index": self.commit_index,
             "last_applied": self.last_applied,
-            "log_length": self.log.last_index(),
+            "log_length": len(self.log.entries),
+            "last_log_index": self.log.last_index(),
+            "snapshot_index": self.log.base_index,
             "keys": len(self.sm.data),
+            "client_sessions": len(self.sm.sessions),
+            "max_client_sessions": self.sm.max_sessions,
             "peers": self.peers,
         }
 
@@ -182,6 +196,9 @@ class RaftNode:
 
     def _send_append(self, peer: str) -> None:
         ni = self.next_index[peer]
+        if ni <= self.log.base_index:
+            self._send_snapshot(peer)
+            return
         prev = ni - 1
         self._send(peer, {
             "type": "AppendEntries",
@@ -192,6 +209,17 @@ class RaftNode:
             "entries": self.log.slice(ni, self.max_batch),
             "leader_commit": self.commit_index,
             "seq": self.hb_seq,
+        })
+
+    def _send_snapshot(self, peer: str) -> None:
+        if self.snapshot is None:
+            raise RuntimeError("compacted log has no snapshot to replicate")
+        self._send(peer, {
+            "type": "InstallSnapshot",
+            "term": self.current_term,
+            "leader_id": self.id,
+            "seq": self.hb_seq,
+            "snapshot": self.snapshot,
         })
 
     def propose(self, command: dict, now: float):
@@ -228,6 +256,23 @@ class RaftNode:
             result = self.sm.apply(entry["command"])
             if self.on_apply:
                 self.on_apply(self.last_applied, entry, result)
+        if self.last_applied - self.log.base_index >= self.snapshot_threshold:
+            self._create_snapshot()
+
+    def _create_snapshot(self) -> None:
+        index = self.last_applied
+        term = self.log.term_at(index)
+        if term is None or index <= self.log.base_index:
+            raise RuntimeError("cannot snapshot an unavailable log entry")
+        snapshot = {
+            "last_included_index": index,
+            "last_included_term": term,
+            "state": self.sm.snapshot(),
+        }
+        suffix = self.log.slice(index + 1, self.log.last_index() - index)
+        self.storage.save_snapshot(snapshot, suffix)
+        self.log.compact(index, term)
+        self.snapshot = snapshot
 
     # ------------------------------------------------------------------ linearizable reads
     def begin_read(self, now: float):
@@ -259,6 +304,8 @@ class RaftNode:
             "RequestVoteReply": self._on_request_vote_reply,
             "AppendEntries": self._on_append_entries,
             "AppendEntriesReply": self._on_append_entries_reply,
+            "InstallSnapshotReply": self._on_install_snapshot_reply,
+            "InstallSnapshot": self._on_install_snapshot,
         }.get(msg.get("type"))
         if handler:
             handler(msg, now)
@@ -298,6 +345,11 @@ class RaftNode:
         self._reset_election_timer(now)
 
         prev_i, prev_t = m["prev_log_index"], m["prev_log_term"]
+        if prev_i < self.log.base_index:
+            reply["conflict_index"] = self.log.base_index + 1
+            reply["conflict_term"] = None
+            self._send(m["from"], reply)
+            return
         if prev_i > self.log.last_index():
             reply["conflict_index"] = self.log.last_index() + 1
             reply["conflict_term"] = None
@@ -334,6 +386,40 @@ class RaftNode:
         reply["match_index"] = last_new
         self._send(m["from"], reply)
 
+    def _on_install_snapshot(self, m: dict, now: float) -> None:
+        snapshot = m["snapshot"]
+        index = snapshot["last_included_index"]
+        term = snapshot["last_included_term"]
+        reply = {"type": "InstallSnapshotReply", "term": self.current_term,
+                 "seq": m["seq"], "success": False, "match_index": 0}
+        if m["term"] < self.current_term:
+            self._send(m["from"], reply)
+            return
+
+        self.role = FOLLOWER
+        self.leader_id = m["leader_id"]
+        self._reset_election_timer(now)
+        if index <= self.last_applied:
+            reply["success"] = True
+            reply["match_index"] = max(index, self.log.base_index)
+            self._send(m["from"], reply)
+            return
+
+        retain_suffix = self.log.term_at(index) == term
+        suffix = self.log.slice(index + 1, self.log.last_index() - index) if retain_suffix else []
+        old_commit = self.commit_index
+        self.storage.save_snapshot(snapshot, suffix)
+        self.snapshot = snapshot
+        self.log = Log(suffix, base_index=index, base_term=term)
+        self.sm.restore(snapshot["state"])
+        self.last_applied = index
+        self.commit_index = max(index, min(old_commit, self.log.last_index())) if retain_suffix else index
+        self._apply_committed()
+
+        reply["success"] = True
+        reply["match_index"] = index
+        self._send(m["from"], reply)
+
     def _on_append_entries_reply(self, m: dict, now: float) -> None:
         if self.role != LEADER or m["term"] != self.current_term:
             return
@@ -364,3 +450,17 @@ class RaftNode:
             self.next_index[p] = new_next
             self._send_append(p)
         # otherwise wait for the next heartbeat rather than hot-looping
+
+    def _on_install_snapshot_reply(self, m: dict, now: float) -> None:
+        if self.role != LEADER or m["term"] != self.current_term:
+            return
+        p = m["from"]
+        if p not in self.next_index or not m["success"]:
+            return
+        self.peer_last_ack[p] = now
+        self.peer_ack_seq[p] = max(self.peer_ack_seq[p], m["seq"])
+        self.match_index[p] = max(self.match_index[p], m["match_index"])
+        self.next_index[p] = self.match_index[p] + 1
+        self._advance_commit()
+        if self.next_index[p] <= self.log.last_index():
+            self._send_append(p)

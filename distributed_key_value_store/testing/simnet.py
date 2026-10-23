@@ -21,12 +21,13 @@ from ..raft.storage import MemoryStorage
 
 class SimCluster:
     def __init__(self, n=3, seed=1, election_timeout=(0.15, 0.30), heartbeat=0.05,
-                 delay=(0.001, 0.01), drop=0.0, check=True):
+                 delay=(0.001, 0.01), drop=0.0, check=True, snapshot_threshold=1000):
         self.rng = random.Random(seed)
         self.now = 0.0
         self.ids = [f"n{i}" for i in range(1, n + 1)]
         self.election_timeout, self.heartbeat = election_timeout, heartbeat
         self.delay, self.drop = delay, drop
+        self.snapshot_threshold = snapshot_threshold
         self.check_enabled = check
         self.storage = {i: MemoryStorage() for i in self.ids}
         self.nodes: dict = {}
@@ -45,6 +46,7 @@ class SimCluster:
         node = RaftNode(
             i, [p for p in self.ids if p != i], self.storage[i],
             election_timeout=self.election_timeout, heartbeat_interval=self.heartbeat,
+            snapshot_threshold=self.snapshot_threshold,
             rng=random.Random(self.rng.random()), now=self.now,
         )
         node.on_apply = lambda idx, entry, res, _i=i: self._record_apply(_i, idx, entry)
@@ -148,7 +150,7 @@ class SimCluster:
                 prev = self.leader_of_term.setdefault(node.current_term, i)
                 assert prev == i, f"two leaders in term {node.current_term}: {prev} and {i}"
                 for idx, entry in self.committed.items():
-                    if entry["term"] < node.current_term:
+                    if entry["term"] < node.current_term and idx > node.log.base_index:
                         assert node.log.term_at(idx) == entry["term"] and node.log.get(idx) == entry, \
                             f"leader completeness violated: {i} (term {node.current_term}) missing committed index {idx}"
         if full:
@@ -158,9 +160,11 @@ class SimCluster:
         live = [self.nodes[i] for i in self.ids if i not in self.down]
         for a, b in itertools.combinations(live, 2):
             upto = min(a.log.last_index(), b.log.last_index())
-            for idx in range(upto, 0, -1):
+            first = max(a.log.base_index, b.log.base_index) + 1
+            for idx in range(upto, first - 1, -1):
                 if a.log.term_at(idx) == b.log.term_at(idx):
-                    assert a.log.entries[:idx] == b.log.entries[:idx], \
+                    assert [a.log.get(i) for i in range(first, idx + 1)] == \
+                           [b.log.get(i) for i in range(first, idx + 1)], \
                         f"log matching violated between {a.id} and {b.id} at index {idx}"
                     break
 
@@ -170,5 +174,8 @@ class SimCluster:
         if len(live) != len(self.ids):
             return False
         first = live[0]
-        return all(n.log.entries == first.log.entries and n.last_applied == n.log.last_index()
-                   and n.commit_index == first.commit_index for n in live)
+        return all(n.log.last_index() == first.log.last_index()
+                   and n.last_applied == n.log.last_index()
+                   and n.commit_index == first.commit_index
+                   and n.sm.data == first.sm.data
+                   and n.sm.sessions == first.sm.sessions for n in live)

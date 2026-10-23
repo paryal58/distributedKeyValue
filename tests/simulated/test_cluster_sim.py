@@ -37,6 +37,21 @@ def test_replicates_to_all_nodes():
         assert node.sm.data == {f"k{i}": i for i in range(10)}
 
 
+def test_compacted_leader_catches_up_follower_with_snapshot():
+    c = SimCluster(n=3, seed=22, snapshot_threshold=4)
+    leader = elect(c)
+    follower = next(i for i in c.ids if i != leader.id)
+    c.crash(follower)
+    for i in range(12):
+        write_and_commit(c, f"snap-{i}", i, seq=i + 1)
+    assert c.leader().log.base_index >= 4
+
+    c.restart(follower)
+    assert c.run_until(c.converged, 5.0)
+    assert c.nodes[follower].sm.data == {f"snap-{i}": i for i in range(12)}
+    assert c.nodes[follower].log.base_index > 0
+
+
 def test_leader_crash_triggers_new_election_and_keeps_committed_data():
     c = SimCluster(n=3, seed=3)
     old = elect(c)
@@ -156,6 +171,6 @@ def test_fuzz_random_faults_preserve_safety(seed):
     assert len(c.leaders()) == 1
     final = c.nodes[c.ids[0]]
     for _, nid, idx, term in acked:                # every acknowledged write survived
-        assert final.log.term_at(idx) == term
+        assert c.committed[idx]["term"] == term
     first = c.nodes[c.ids[0]].sm.data
     assert all(node.sm.data == first for node in c.nodes.values())

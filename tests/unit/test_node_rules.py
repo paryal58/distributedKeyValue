@@ -115,3 +115,37 @@ def test_single_node_cluster_elects_itself_and_commits():
     assert n.role == LEADER
     idx, term = n.propose({"op": "put", "key": "a", "value": 1}, 10.0)
     assert n.last_applied >= idx and n.sm.get("a") == (True, 1)
+
+
+def test_committed_prefix_is_snapshotted_and_restored():
+    st = MemoryStorage()
+    n = RaftNode("n1", ("n2", "n3"), st, snapshot_threshold=2, rng=random.Random(1))
+    n.receive(ae(1, 0, 0, [e(1), e(1)], commit=2), 0)
+    n.drain()
+    assert n.log.base_index == 2 and n.log.entries == []
+    assert n.commit_index == n.last_applied == 2
+    assert st.load_snapshot()["last_included_index"] == 2
+
+    reborn = make(storage=st)
+    assert reborn.log.base_index == 2
+    assert reborn.commit_index == reborn.last_applied == 2
+    assert reborn.sm.get("k") == (True, 1)
+
+
+def test_install_snapshot_restores_state_and_accepts_following_entries():
+    n = make()
+    snapshot = {
+        "last_included_index": 5,
+        "last_included_term": 2,
+        "state": {"data": {"from-snapshot": "yes"}, "sessions": {}},
+    }
+    n.receive({"type": "InstallSnapshot", "from": "n2", "to": "n1", "term": 2,
+               "leader_id": "n2", "seq": 1, "snapshot": snapshot}, 0)
+    reply = reply_of(n)
+    assert reply["type"] == "InstallSnapshotReply" and reply["success"]
+    assert n.log.base_index == 5 and n.commit_index == n.last_applied == 5
+    assert n.sm.get("from-snapshot") == (True, "yes")
+
+    n.receive(ae(2, 5, 2, [e(2)], commit=6), 0)
+    assert reply_of(n)["success"]
+    assert n.log.last_index() == 6 and n.sm.get("k") == (True, 2)

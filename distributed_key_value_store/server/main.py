@@ -11,6 +11,7 @@ import threading
 
 from ..raft.node import RaftNode
 from ..raft.storage import FileStorage
+from ..raft.state_machine import KVStateMachine
 from .http_api import make_http_server
 from .server import RaftServer
 from .transport import HttpTransport
@@ -38,8 +39,10 @@ def main(argv=None):
     storage = FileStorage(args.data_dir or os.path.join("data", args.id), fsync=not args.no_fsync)
     node = RaftNode(
         args.id, list(peers), storage,
+        state_machine=KVStateMachine(max_sessions=cfg.get("max_client_sessions", 10000)),
         election_timeout=(cfg.get("election_timeout_min", 0.3), cfg.get("election_timeout_max", 0.6)),
         heartbeat_interval=cfg.get("heartbeat_interval", 0.1),
+        snapshot_threshold=cfg.get("snapshot_threshold", 1000),
         now=__import__("time").monotonic(),
     )
     raft = RaftServer(node, HttpTransport(peers))
@@ -53,8 +56,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     logging.getLogger("distributed_key_value_store").info(
-        "%s up on port %d (%d-node cluster, log has %d entries, term %d)",
-        args.id, nodes[args.id]["port"], len(nodes), node.log.last_index(), node.current_term)
+        "%s up on port %d (%d-node cluster, log has %d retained entries from snapshot %d, term %d)",
+        args.id, nodes[args.id]["port"], len(nodes), len(node.log.entries),
+        node.log.base_index, node.current_term)
     try:
         http.serve_forever()
     finally:

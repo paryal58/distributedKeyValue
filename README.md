@@ -35,6 +35,8 @@ The older `conclave` command and `CONCLAVE_CONFIG` setting remain available.
 ## Use the HTTP API
 Each node accepts requests. If you contact a non-coordinator, it points clients toward the current
 coordinator. The `stale=1` option intentionally reads only that node's local copy.
+Client request bodies are limited to 1 MiB, Raft peer messages to 64 MiB, and keys to 1,024
+characters. Oversized bodies are rejected with HTTP 413.
 
 ```bash
 curl -X PUT localhost:5001/kv/name -d 'Mbappe'

@@ -62,7 +62,10 @@ def main(argv=None):
     try:
         http.serve_forever()
     finally:
-        raft.stop()
+        try:
+            http.server_close()
+        finally:
+            raft.stop()
 
 
 if __name__ == "__main__":

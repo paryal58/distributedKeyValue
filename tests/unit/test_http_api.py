@@ -21,8 +21,13 @@ class FakeRaftServer:
     def __init__(self):
         self.commands = []
         self.messages = []
+        self.write_started = None
+        self.release_write = None
 
     def write(self, command, _timeout):
+        if self.write_started is not None:
+            self.write_started.set()
+            self.release_write.wait(2)
         self.commands.append(command)
         return "ok", {"ok": True}
 
@@ -46,6 +51,7 @@ class FakeRaftServer:
 def http_api():
     raft = FakeRaftServer()
     server = make_http_server("127.0.0.1", 0, raft)
+    raft.http_server = server
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     try:
@@ -131,3 +137,30 @@ def test_accepts_valid_peer_message_but_rejects_unconfigured_sender(http_api):
     assert request(port, "POST", "/raft", json.dumps(message),
                    {"Content-Type": "application/json"})[0] == 400
     assert len(raft.messages) == 1
+
+
+def test_server_close_waits_for_in_flight_request(http_api):
+    raft, port = http_api
+    raft.write_started = threading.Event()
+    raft.release_write = threading.Event()
+    responses = []
+    request_thread = threading.Thread(
+        target=lambda: responses.append(request(port, "PUT", "/kv/key", "value")))
+    request_thread.start()
+    assert raft.write_started.wait(2)
+
+    server = raft.http_server
+    server.shutdown()
+    close_done = threading.Event()
+    close_thread = threading.Thread(
+        target=lambda: (server.server_close(), close_done.set()))
+    close_thread.start()
+    assert not close_done.wait(0.1)
+
+    raft.release_write.set()
+    request_thread.join(2)
+    close_thread.join(2)
+    assert not request_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert responses == [(200, {"ok": True, "result": {"ok": True},
+                                "leader": "n1", "term": 1})]

@@ -24,7 +24,8 @@ MAX_KEY_LENGTH = 1024
 
 
 class _Server(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
+    block_on_close = True
     request_queue_size = 256
     allow_reuse_address = True
 

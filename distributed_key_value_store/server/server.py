@@ -23,16 +23,33 @@ class RaftServer:
         self.results: OrderedDict = OrderedDict()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="raft-ticker", daemon=True)
+        self._lifecycle_lock = threading.Lock()
+        self._started = False
+        self._stopped = False
         node.on_apply = self._on_apply
 
     # ---- lifecycle -------------------------------------------------------
     def start(self):
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._stopped:
+                raise RuntimeError("cannot start a stopped RaftServer")
+            if self._started:
+                raise RuntimeError("RaftServer is already started")
+            self._started = True
+            self._thread.start()
 
     def stop(self):
-        self._stop.set()
-        self.transport.close()
-        self.node.storage.close()
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stop.set()
+            if self._started:
+                self._thread.join()
+            try:
+                self.transport.close()
+            finally:
+                self.node.storage.close()
+            self._stopped = True
 
     def _run(self):
         while not self._stop.is_set():
@@ -40,7 +57,7 @@ class RaftServer:
                 self.node.tick(time.monotonic())
                 self._flush()
                 self.cond.notify_all()
-            time.sleep(self.tick_interval)
+            self._stop.wait(self.tick_interval)
 
     # ---- internals (call with the lock held) -----------------------------
     def _flush(self):

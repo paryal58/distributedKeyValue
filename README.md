@@ -57,6 +57,10 @@ client.put("name", "Mbappe")
 print(client.get("name"))
 ```
 
+Calls made through one `Client` instance are serialized, including writes, so their sequence
+numbers are sent in order. If multiple client instances use the same `client_id`, the caller
+must coordinate requests between them.
+
 ## Configuration and reliability
 Cluster members are listed in `config/local-3.json`. All nodes in a cluster should use the same
 configuration. Three nodes can continue with one unavailable; five can continue with two. In

@@ -2,16 +2,28 @@
 
 Every write carries (client_id, seq). A retry re-sends the SAME seq, so if the first attempt
 actually committed (e.g. the leader died right after), the state machine returns the cached
-result instead of applying it twice. A client must have at most one request in flight.
+result instead of applying it twice. Calls on one Client instance are serialized to preserve
+sequence order. If multiple Client instances share a client_id, callers must coordinate them.
 """
 from __future__ import annotations
 
 import http.client
 import json
+import threading
 import time
 import uuid
+from functools import wraps
 from typing import Callable, Optional
 from urllib.parse import quote
+
+
+def _serialized(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._request_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class ClusterUnavailable(Exception):
@@ -28,6 +40,7 @@ class Client:
         self.client_id = client_id or uuid.uuid4().hex[:12]
         self.timeout = timeout
         self.http_timeout = http_timeout
+        self._request_lock = threading.Lock()
         if initial_seq < 0:
             raise ValueError("initial_seq must be non-negative")
         self.seq = initial_seq
@@ -96,11 +109,13 @@ class Client:
         if self.on_sequence:
             self.on_sequence(self.seq)
 
+    @_serialized
     def put(self, key: str, value) -> None:
         self._next_seq()
         self._call("PUT", f"/kv/{quote(key, safe='')}",
                    {"value": value, "client_id": self.client_id, "seq": self.seq})
 
+    @_serialized
     def delete(self, key: str) -> bool:
         """Returns True if the key existed."""
         self._next_seq()
@@ -108,6 +123,7 @@ class Client:
                           {"client_id": self.client_id, "seq": self.seq})
         return bool(data["result"].get("existed"))
 
+    @_serialized
     def get(self, key: str, stale: bool = False, node: Optional[str] = None):
         """Linearizable read through the leader. stale=True reads one node's local state instead."""
         path = f"/kv/{quote(key, safe='')}"
@@ -117,6 +133,7 @@ class Client:
         data = self._call("GET", path)
         return data["value"] if data.get("found") else None
 
+    @_serialized
     def status(self, timeout: float = 0.5) -> dict:
         """node_id -> /status dict, or None if the node is unreachable."""
         out = {}
@@ -127,6 +144,7 @@ class Client:
                 out[nid] = None
         return out
 
+    @_serialized
     def debug_state(self, node_id: str, timeout: float = 1.0):
         try:
             return self._http(node_id, "GET", "/debug/state", timeout=timeout)[1]

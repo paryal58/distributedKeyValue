@@ -1,3 +1,5 @@
+import json
+
 from distributed_key_value_store.raft.log import Log
 from distributed_key_value_store.raft.state_machine import KVStateMachine
 from distributed_key_value_store.raft.storage import FileStorage
@@ -87,6 +89,42 @@ def test_file_storage_tolerates_torn_last_line(tmp_path):
     assert [x["term"] for x in entries] == [1, 2]
 
 
+def test_file_storage_rejects_complete_malformed_final_line_without_rewriting(tmp_path):
+    storage = FileStorage(str(tmp_path), fsync=False)
+    storage.load()
+    storage.append([e(1)])
+    storage.close()
+
+    with open(tmp_path / "log.jsonl", "ab") as f:
+        f.write(b'{"term":2,"command":}\n')
+    original = (tmp_path / "log.jsonl").read_bytes()
+
+    try:
+        FileStorage(str(tmp_path), fsync=False).load()
+    except ValueError as exc:
+        assert "invalid JSON in log record at line 3" in str(exc)
+    else:
+        raise AssertionError("complete malformed final record should fail to load")
+
+    assert (tmp_path / "log.jsonl").read_bytes() == original
+
+
+def test_file_storage_rewrites_valid_unterminated_record_before_future_appends(tmp_path):
+    storage = FileStorage(str(tmp_path), fsync=False)
+    storage.load()
+    storage.append([e(1)])
+    storage.close()
+
+    with open(tmp_path / "log.jsonl", "ab") as f:
+        f.write(json.dumps(e(2), separators=(",", ":")).encode())
+
+    recovered = FileStorage(str(tmp_path), fsync=False)
+    assert [entry["term"] for entry in recovered.load()[2]] == [1, 2]
+    recovered.append([e(3)])
+    recovered.close()
+    assert [entry["term"] for entry in FileStorage(str(tmp_path), fsync=False).load()[2]] == [1, 2, 3]
+
+
 def test_file_storage_snapshot_compaction_and_restart(tmp_path):
     storage = FileStorage(str(tmp_path), fsync=False)
     storage.load()
@@ -111,7 +149,6 @@ def test_file_storage_recovers_if_crash_happens_between_snapshot_and_log_rewrite
     storage.append(entries)
     storage.close()
     with open(tmp_path / "snapshot.json", "w") as f:
-        import json
         json.dump({"last_included_index": 2, "last_included_term": 1,
                    "state": {"data": {"a": 1}, "sessions": {}}}, f)
 

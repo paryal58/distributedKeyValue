@@ -73,25 +73,29 @@ class FileStorage:
 
         entries = []
         base_index = 0
-        torn_tail = False
+        rewrite_log = False
         if os.path.exists(self.log_path):
             with open(self.log_path, "rb") as f:
-                lines = f.read().split(b"\n")
+                contents = f.read()
+            lines = contents.split(b"\n")
+            has_final_newline = contents.endswith(b"\n")
             for i, line in enumerate(lines):
                 if not line:
                     continue
                 try:
                     value = json.loads(line)
-                except ValueError:
-                    if i >= len(lines) - 2:
-                        torn_tail = True
+                except ValueError as exc:
+                    if i == len(lines) - 1 and not has_final_newline:
+                        rewrite_log = True
                         break
-                    raise
+                    raise ValueError(f"invalid JSON in log record at line {i + 1}") from exc
                 if i == 0 and isinstance(value, dict) and "_base_index" in value:
                     base_index = value["_base_index"]
                 else:
                     entries.append(value)
-        if torn_tail:
+                if i == len(lines) - 1 and not has_final_newline:
+                    rewrite_log = True
+        if rewrite_log:
             self.rewrite(entries, base_index)
         if base_index > snapshot_index:
             raise ValueError("log base index is newer than the durable snapshot")

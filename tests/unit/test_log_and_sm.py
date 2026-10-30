@@ -34,6 +34,26 @@ def test_log_compaction_preserves_absolute_indices():
     assert log.append(e(3)) == 5
 
 
+def test_log_rejects_truncating_compacted_prefix():
+    log = Log([e(1), e(2)], base_index=3, base_term=1)
+
+    with pytest.raises(ValueError, match="cannot truncate a compacted log entry"):
+        log.truncate_from(3)
+
+    assert log.last_index() == 5
+
+
+def test_log_rejects_compaction_at_wrong_term_or_beyond_end():
+    log = Log([e(1), e(2)])
+
+    with pytest.raises(ValueError, match="snapshot term does not match log"):
+        log.compact(1, 2)
+    with pytest.raises(ValueError, match="snapshot index is outside the retained log"):
+        log.compact(3, 2)
+
+    assert log.base_index == 0 and log.last_index() == 2
+
+
 def test_state_machine_put_delete_and_dedup():
     sm = KVStateMachine()
     cmd = {"op": "put", "key": "a", "value": "1", "client_id": "c", "seq": 1}
@@ -46,6 +66,41 @@ def test_state_machine_put_delete_and_dedup():
     assert sm.apply({"op": "delete", "key": "a", "client_id": "c", "seq": 3}) == {"ok": True, "existed": True}
     assert sm.get("a") == (False, None)
     assert sm.apply({"op": "noop"}) is None
+
+
+def test_state_machine_ignores_out_of_order_sequence_without_changing_dedup_result():
+    sm = KVStateMachine()
+    sm.apply({"op": "put", "key": "a", "value": "new", "client_id": "c", "seq": 5})
+
+    result = sm.apply({"op": "put", "key": "a", "value": "old", "client_id": "c", "seq": 3})
+
+    assert result == {"ok": True, "stale": True}
+    assert sm.get("a") == (True, "new")
+    assert sm.sessions["c"] == (5, {"ok": True})
+
+
+def test_state_machine_duplicate_delete_returns_original_result():
+    sm = KVStateMachine()
+    sm.apply({"op": "put", "key": "a", "value": 1})
+    command = {"op": "delete", "key": "a", "client_id": "c", "seq": 1}
+
+    assert sm.apply(command) == {"ok": True, "existed": True}
+    assert sm.apply(command) == {"ok": True, "existed": True}
+    assert sm.get("a") == (False, None)
+
+
+def test_state_machine_snapshot_is_detached_from_live_and_restored_state():
+    sm = KVStateMachine()
+    sm.apply({"op": "put", "key": "a", "value": {"items": [1]}})
+    snapshot = sm.snapshot()
+
+    snapshot["data"]["a"]["items"].append(2)
+    assert sm.get("a") == (True, {"items": [1]})
+
+    restored = KVStateMachine()
+    restored.restore(sm.snapshot())
+    restored.data["a"]["items"].append(3)
+    assert sm.get("a") == (True, {"items": [1]})
 
 
 def test_state_machine_snapshot_and_bounded_sessions():
@@ -61,6 +116,18 @@ def test_state_machine_snapshot_and_bounded_sessions():
                                "client_id": "c2", "seq": 1})
     assert rejected == {"ok": False, "error": "session_limit", "limit": 1}
     assert restored.get("b") == (False, None)
+
+
+def test_state_machine_rejects_snapshot_exceeding_session_limit():
+    sm = KVStateMachine(max_sessions=1)
+
+    with pytest.raises(ValueError, match="snapshot exceeds configured client session limit"):
+        sm.restore({
+            "data": {},
+            "sessions": {"c1": [1, {"ok": True}], "c2": [1, {"ok": True}]},
+        })
+
+    assert sm.data == {} and sm.sessions == {}
 
 
 def test_file_storage_roundtrip_and_truncation(tmp_path):

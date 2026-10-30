@@ -1,9 +1,11 @@
 """Real processes, real sockets, real SIGKILLs."""
+import json
 import time
 
 import pytest
 
 from distributed_key_value_store.client.client import ClusterUnavailable
+from distributed_key_value_store.client.cli import main as cli_main
 from distributed_key_value_store.testing.proc_cluster import ProcCluster
 
 pytestmark = pytest.mark.integration
@@ -23,6 +25,144 @@ def test_put_get_delete(cluster):
     assert kv.delete("name") is True
     assert kv.get("name") is None
     assert kv.delete("name") is False
+
+
+def test_python_client_json_value_and_escaped_key_workflow(cluster):
+    kv = cluster.client()
+    key = "profile/team name/☃"
+    value = {"name": "Mbappe", "stats": [1, None, True]}
+
+    kv.put(key, value)
+    assert kv.get(key) == value
+    assert cluster.wait_converged()[key] == value
+    assert kv.get(key, stale=True, node=cluster.ids[0]) == value
+
+    assert kv.delete(key) is True
+    assert kv.get(key) is None
+    assert kv.delete(key) is False
+
+
+def test_cli_crud_workflow_persists_write_sequence(cluster, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = cluster.config_path
+
+    assert cli_main(["--config", config, "put", "workflow-key", "first"]) == 0
+    assert "OK (leader:" in capsys.readouterr().out
+    session_files = list((tmp_path / ".distributed-key-value-store").glob("*.json"))
+    assert len(session_files) == 1
+    assert json.loads(session_files[0].read_text())["seq"] == 1
+
+    assert cli_main(["--config", config, "get", "workflow-key"]) == 0
+    assert capsys.readouterr().out == "first\n"
+
+    assert cli_main(["--config", config, "put", "workflow-key", "updated"]) == 0
+    capsys.readouterr()
+    assert json.loads(session_files[0].read_text())["seq"] == 2
+    assert cli_main(["--config", config, "get", "workflow-key"]) == 0
+    assert capsys.readouterr().out == "updated\n"
+
+    assert cli_main(["--config", config, "delete", "workflow-key"]) == 0
+    assert "OK (leader:" in capsys.readouterr().out
+    assert json.loads(session_files[0].read_text())["seq"] == 3
+    assert cli_main(["--config", config, "get", "workflow-key"]) == 1
+    assert capsys.readouterr().err == "(not found)\n"
+
+
+def test_python_client_round_trips_falsey_json_values(cluster):
+    kv = cluster.client()
+    values = {"empty-string": "", "zero": 0, "false": False, "empty-list": [], "empty-object": {}}
+    for key, value in values.items():
+        kv.put(key, value)
+    assert {key: kv.get(key) for key in values} == values
+    assert cluster.wait_converged() == values
+
+
+def test_overwriting_a_key_replicates_the_latest_value(cluster):
+    kv = cluster.client()
+    kv.put("mutable", "first")
+    kv.put("mutable", {"revision": 2})
+    assert kv.get("mutable") == {"revision": 2}
+    assert cluster.wait_converged() == {"mutable": {"revision": 2}}
+
+
+def test_deleting_a_missing_key_is_safe_and_does_not_change_data(cluster):
+    kv = cluster.client()
+    kv.put("retained", "value")
+    assert kv.delete("missing") is False
+    assert kv.get("retained") == "value"
+    assert cluster.wait_converged() == {"retained": "value"}
+
+
+def test_write_sequence_callback_tracks_put_and_delete(cluster):
+    sequences = []
+    kv = cluster.client(on_sequence=sequences.append)
+    kv.put("sequenced", 1)
+    assert kv.delete("sequenced") is True
+    assert sequences == [1, 2]
+    assert kv.seq == 2
+    assert kv.get("sequenced") is None
+
+
+def test_new_client_can_continue_an_existing_client_session(cluster):
+    client_id = "continued-session"
+    first = cluster.client(client_id=client_id)
+    first.put("before", 1)
+
+    resumed = cluster.client(client_id=client_id, initial_seq=first.seq)
+    resumed.put("after", 2)
+
+    assert resumed.seq == 2
+    assert resumed.get("before") == 1
+    assert resumed.get("after") == 2
+    assert cluster.wait_converged() == {"before": 1, "after": 2}
+
+
+def test_client_can_read_when_initially_targeting_a_follower(cluster):
+    kv = cluster.client()
+    kv.put("redirected-read", "available")
+    leader = cluster.wait_for_leader()
+    follower = next(node for node in cluster.ids if node != leader)
+    kv.target = follower
+
+    assert kv.get("redirected-read") == "available"
+    assert kv.last_leader == leader
+
+
+def test_cli_leader_and_status_commands_report_cluster(cluster, capsys):
+    config = cluster.config_path
+    assert cli_main(["--config", config, "leader"]) == 0
+    leader_output = capsys.readouterr().out.strip()
+    assert leader_output in cluster.ids
+
+    assert cli_main(["--config", config, "status"]) == 0
+    status_output = capsys.readouterr().out
+    assert "NODE" in status_output
+    assert "cluster: leader=" in status_output
+    assert leader_output in status_output
+
+
+def test_offline_follower_catches_up_to_write_and_delete(cluster):
+    kv = cluster.client()
+    leader = cluster.wait_for_leader()
+    follower = next(node for node in cluster.ids if node != leader)
+    cluster.kill(follower)
+
+    kv.put("catch-up", "present")
+    cluster.restart(follower)
+    assert cluster.wait_converged(timeout=15) == {"catch-up": "present"}
+
+    assert kv.delete("catch-up") is True
+    assert cluster.wait_converged(timeout=15) == {}
+
+
+def test_single_node_process_cluster_completes_basic_workflow():
+    with ProcCluster(n=1) as single:
+        single.wait_for_leader()
+        kv = single.client()
+        kv.put("solo", {"works": True})
+        assert kv.get("solo") == {"works": True}
+        assert kv.delete("solo") is True
+        assert kv.get("solo") is None
 
 
 def test_any_node_redirects_to_leader(cluster):

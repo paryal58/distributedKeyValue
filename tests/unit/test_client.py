@@ -1,6 +1,8 @@
 import threading
 
-from distributed_key_value_store.client.client import Client
+import pytest
+
+from distributed_key_value_store.client.client import Client, summarize
 
 
 def test_concurrent_writes_on_one_client_are_serialized():
@@ -48,3 +50,41 @@ def test_concurrent_writes_on_one_client_are_serialized():
         ("/kv/first", 1),
         ("/kv/second", 2),
     ]
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        ({}, ("no_quorum", None, None)),
+        ({"n1": {"role": "leader", "term": 2}, "n2": None, "n3": None},
+         ("no_quorum", None, None)),
+        ({"n1": {"role": "follower", "term": 2}, "n2": {"role": "follower", "term": 2},
+          "n3": None}, ("electing", None, None)),
+        ({"n1": {"id": "n1", "role": "leader", "term": 2},
+          "n2": {"id": "n2", "role": "follower", "term": 3},
+          "n3": {"id": "n3", "role": "leader", "term": 4}},
+         ("ok", "n3", 4)),
+    ],
+)
+def test_summarize_cluster_status_handles_quorum_and_competing_leaders(statuses, expected):
+    assert summarize(statuses) == expected
+
+
+def test_put_escapes_all_reserved_characters_in_key():
+    client = Client({"n1": "127.0.0.1:5001"})
+    requests = []
+    client._call = lambda method, path, body=None: requests.append((method, path, body))
+
+    client.put("team/a b?c#d", "value")
+
+    assert requests[0][0:2] == ("PUT", "/kv/team%2Fa%20b%3Fc%23d")
+
+
+def test_write_sequence_callback_runs_before_request():
+    observed = []
+    client = Client({"n1": "127.0.0.1:5001"}, on_sequence=lambda seq: observed.append(
+        (seq, client.seq)))
+    client._call = lambda method, path, body=None: {"result": {"ok": True}}
+
+    client.put("key", "value")
+    assert observed == [(1, 1)]

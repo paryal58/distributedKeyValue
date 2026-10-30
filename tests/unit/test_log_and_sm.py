@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from distributed_key_value_store.raft.log import Log
 from distributed_key_value_store.raft.state_machine import KVStateMachine
 from distributed_key_value_store.raft.storage import FileStorage
@@ -85,8 +87,11 @@ def test_file_storage_tolerates_torn_last_line(tmp_path):
     s.close()
     with open(tmp_path / "log.jsonl", "ab") as f:
         f.write(b'{"term":3,"comm')  # crash mid-write
-    entries = FileStorage(str(tmp_path), fsync=False).load()[2]
-    assert [x["term"] for x in entries] == [1, 2]
+    recovered = FileStorage(str(tmp_path), fsync=False)
+    assert [x["term"] for x in recovered.load()[2]] == [1, 2]
+    recovered.append([e(3)])
+    recovered.close()
+    assert [x["term"] for x in FileStorage(str(tmp_path), fsync=False).load()[2]] == [1, 2, 3]
 
 
 def test_file_storage_rejects_complete_malformed_final_line_without_rewriting(tmp_path):
@@ -109,6 +114,23 @@ def test_file_storage_rejects_complete_malformed_final_line_without_rewriting(tm
     assert (tmp_path / "log.jsonl").read_bytes() == original
 
 
+def test_file_storage_rejects_malformed_record_in_middle_without_rewriting(tmp_path):
+    log_path = tmp_path / "log.jsonl"
+    records = [
+        b'{"_base_index":0}',
+        json.dumps(e(1), separators=(",", ":")).encode(),
+        b'{"term":2,"command":}\n',
+        json.dumps(e(3), separators=(",", ":")).encode() + b"\n",
+    ]
+    log_path.write_bytes(b"\n".join(records) + b"\n")
+    original = log_path.read_bytes()
+
+    with pytest.raises(ValueError, match="invalid JSON in log record at line 3"):
+        FileStorage(str(tmp_path), fsync=False).load()
+
+    assert log_path.read_bytes() == original
+
+
 def test_file_storage_rewrites_valid_unterminated_record_before_future_appends(tmp_path):
     storage = FileStorage(str(tmp_path), fsync=False)
     storage.load()
@@ -123,6 +145,29 @@ def test_file_storage_rewrites_valid_unterminated_record_before_future_appends(t
     recovered.append([e(3)])
     recovered.close()
     assert [entry["term"] for entry in FileStorage(str(tmp_path), fsync=False).load()[2]] == [1, 2, 3]
+
+
+def test_file_storage_rejects_snapshot_ahead_of_log_without_rewriting(tmp_path):
+    storage = FileStorage(str(tmp_path), fsync=False)
+    storage.load()
+    storage.append([e(1)])
+    storage.close()
+
+    log_path = tmp_path / "log.jsonl"
+    snapshot_path = tmp_path / "snapshot.json"
+    log_before = log_path.read_bytes()
+    snapshot = {
+        "last_included_index": 2,
+        "last_included_term": 1,
+        "state": {"data": {}, "sessions": {}},
+    }
+    snapshot_path.write_text(json.dumps(snapshot))
+
+    with pytest.raises(ValueError, match="durable snapshot is ahead of the persisted log"):
+        FileStorage(str(tmp_path), fsync=False).load()
+
+    assert log_path.read_bytes() == log_before
+    assert json.loads(snapshot_path.read_text()) == snapshot
 
 
 def test_file_storage_snapshot_compaction_and_restart(tmp_path):
